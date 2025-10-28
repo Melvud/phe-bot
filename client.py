@@ -18,7 +18,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, Message, ReplyKeyboardMarkup, WebAppInfo
+    KeyboardButton, Message, ReplyKeyboardMarkup, WebAppInfo,
+    MenuButtonWebApp, MenuButtonDefault  # <--- ИЗМЕНЕНИЕ 1: Добавлены импорты
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -541,6 +542,19 @@ dp = Dispatcher()
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+# --- ИЗМЕНЕНИЕ 2: Добавлена функция apply_menu_button ---
+async def apply_menu_button(bot: Bot, user_id: int, is_admin_bool: bool):
+    """Sets the correct menu button (WebApp for admin, Default for others)"""
+    try:
+        if is_admin_bool and WEBAPP_URL:
+            mb = MenuButtonWebApp(text="Admin Panel", web_app=WebAppInfo(url=WEBAPP_URL))
+        else:
+            mb = MenuButtonDefault()
+        await bot.set_chat_menu_button(chat_id=user_id, menu_button=mb)
+    except Exception as e:
+        print(f"Failed to apply menu button for {user_id}: {e}") # Используем print()
+# --- Конец ИЗМЕНЕНИЯ 2 ---
+
 async def is_approved(user_id: int) -> bool:
     """Проверить что пользователь одобрен"""
     if is_admin(user_id):
@@ -682,6 +696,11 @@ async def cmd_start(message: Message, state: FSMContext):
     if is_admin(user_id):
         with contextlib.suppress(Exception):
             await set_status(user_id, "approved")
+
+    # --- ИЗМЕНЕНИЕ 3: Устанавливаем кнопку меню при /start ---
+    # Устанавливаем кнопку меню в зависимости от статуса админа
+    await apply_menu_button(bot, user_id, is_admin(user_id))
+    # --- Конец ИЗМЕНЕНИЯ 3 ---
 
     await state.clear()
     existing = await get_user(user_id)
@@ -1641,6 +1660,15 @@ async def main():
     print(f"✅ API server started on port {API_PORT}")
     print(f"✅ Web Admin: {WEBAPP_URL}")
     print(f"✅ Bot is running...")
+
+    # --- ИЗМЕНЕНИЕ 4: Устанавливаем глобальную кнопку по умолчанию ---
+    # Сбрасываем кнопку меню, установленную в BotFather
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+        print("Set global default menu button (cleared WebApp).")
+    except Exception as e:
+        print(f"Could not set global default menu button: {e}")
+    # --- Конец ИЗМЕНЕНИЯ 4 ---
 
     # Start scheduler and polling
     asyncio.create_task(scheduler_loop())
