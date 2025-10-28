@@ -21,7 +21,7 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup, WebAppInfo,
     MenuButtonWebApp, MenuButtonDefault, Update, User  # <--- Добавлены импорты
 )
-from aiogram.dispatcher.middlewares.base import BaseMiddleware # <--- Добавлен импорт
+from aiogram import BaseMiddleware
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
@@ -728,8 +728,8 @@ async def cmd_start(message: Message, state: FSMContext):
         with contextlib.suppress(Exception):
             await set_status(user_id, "approved")
 
-    # Вызов apply_menu_button УБРАН отсюда,
-    # т.к. MenuButtonMiddleware теперь делает это при каждом обновлении.
+    with contextlib.suppress(Exception):
+        await apply_menu_button(bot, user_id, is_admin(user_id))
 
     await state.clear()
     existing = await get_user(user_id)
@@ -1716,9 +1716,8 @@ async def main():
     except Exception as e:
         print(f"Could not set global default menu button: {e}")
 
-    # --- РЕГИСТРАЦИЯ MIDDLEWARE ---
-    dp.update.outer_middleware(MenuButtonMiddleware())
-    # ---
+    dp.update.middleware(MenuButtonMiddleware())
+
 
     # Start scheduler and polling
     asyncio.create_task(scheduler_loop())
