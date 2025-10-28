@@ -19,8 +19,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     KeyboardButton, Message, ReplyKeyboardMarkup, WebAppInfo,
-    MenuButtonWebApp, MenuButtonDefault  # <--- ИЗМЕНЕНИЕ 1: Добавлены импорты
+    MenuButtonWebApp, MenuButtonDefault, Update, User  # <--- Добавлены импорты
 )
+from aiogram.dispatcher.middlewares.base import BaseMiddleware # <--- Добавлен импорт
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
@@ -529,8 +530,17 @@ async def get_run_detail(run_id: int):
 # ====== MATCHING (using matcher.py) ======
 async def run_matching_once() -> int:
     """Call the real matching function from matcher.py"""
-    from matcher import run_matching_once as matcher_run
-    return await matcher_run(_pool, bot, TIMEZONE, LOOKBACK_WEEKS, STARTER_QUESTIONS)
+    # Убедитесь, что у вас есть файл matcher.py с этой функцией
+    try:
+        from matcher import run_matching_once as matcher_run
+        return await matcher_run(_pool, bot, TIMEZONE, LOOKBACK_WEEKS, STARTER_QUESTIONS)
+    except ImportError:
+        print("!!! ОШИБКА: Файл matcher.py не найден. Функция run_matching_once не будет работать.")
+        return 0
+    except Exception as e:
+        print(f"!!! ОШИБКА при импорте/вызове matcher.py: {e}")
+        return 0
+
 
 # ====== UTILS ======
 bot = Bot(
@@ -542,7 +552,7 @@ dp = Dispatcher()
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# --- ИЗМЕНЕНИЕ 2: Добавлена функция apply_menu_button ---
+# --- НОВАЯ ЛОГИКА ---
 async def apply_menu_button(bot: Bot, user_id: int, is_admin_bool: bool):
     """Sets the correct menu button (WebApp for admin, Default for others)"""
     try:
@@ -553,7 +563,28 @@ async def apply_menu_button(bot: Bot, user_id: int, is_admin_bool: bool):
         await bot.set_chat_menu_button(chat_id=user_id, menu_button=mb)
     except Exception as e:
         print(f"Failed to apply menu button for {user_id}: {e}") # Используем print()
-# --- Конец ИЗМЕНЕНИЯ 2 ---
+
+class MenuButtonMiddleware(BaseMiddleware):
+    """
+    Этот Middleware срабатывает при *каждом* обновлении от пользователя.
+    Он проверяет, админ ли пользователь, и устанавливает *правильную*
+    кнопку меню (WebApp для админа, Default для всех остальных).
+    """
+    async def __call__(self, handler, event: Update, data):
+        # Получаем пользователя из события
+        user: Optional[User] = data.get("event_from_user")
+        bot: Bot = data["bot"]
+
+        if user:
+            # Используем contextlib.suppress, как в client.py
+            with contextlib.suppress(Exception):
+                # Проверяем админа и устанавливаем кнопку
+                await apply_menu_button(bot, user.id, is_admin(user.id))
+        
+        # Продолжаем обработку
+        return await handler(event, data)
+# --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
 
 async def is_approved(user_id: int) -> bool:
     """Проверить что пользователь одобрен"""
@@ -697,10 +728,8 @@ async def cmd_start(message: Message, state: FSMContext):
         with contextlib.suppress(Exception):
             await set_status(user_id, "approved")
 
-    # --- ИЗМЕНЕНИЕ 3: Устанавливаем кнопку меню при /start ---
-    # Устанавливаем кнопку меню в зависимости от статуса админа
-    await apply_menu_button(bot, user_id, is_admin(user_id))
-    # --- Конец ИЗМЕНЕНИЯ 3 ---
+    # Вызов apply_menu_button УБРАН отсюда,
+    # т.к. MenuButtonMiddleware теперь делает это при каждом обновлении.
 
     await state.clear()
     existing = await get_user(user_id)
@@ -1394,10 +1423,12 @@ async def events_upcoming(message: Message):
     # Получить опубликованные события (не socials)
     events = await db_fetch("""
         SELECT id, title, description, location, starts_at, ends_at, 
-               photo_url, registration_url, capacity
+               (SELECT photo_url FROM event_media WHERE event_id=events.id AND type='photo' LIMIT 1) as photo_url,
+               (SELECT url FROM event_links WHERE event_id=events.id AND type='registration' LIMIT 1) as registration_url,
+               capacity
         FROM events
         WHERE status = 'published' 
-          AND event_type = 'event'
+          AND (event_type = 'event' OR event_type IS NULL)
           AND (starts_at IS NULL OR starts_at >= NOW())
         ORDER BY starts_at ASC NULLS LAST
         LIMIT 10
@@ -1426,7 +1457,8 @@ async def socials_entry(message: Message):
     # Получить опубликованные social события
     socials = await db_fetch("""
         SELECT id, title, description, location, starts_at, 
-               photo_url, registration_url
+               (SELECT photo_url FROM event_media WHERE event_id=events.id AND type='photo' LIMIT 1) as photo_url,
+               (SELECT url FROM event_links WHERE event_id=events.id AND type='registration' LIMIT 1) as registration_url
         FROM events
         WHERE status = 'published' 
           AND event_type = 'social'
@@ -1465,7 +1497,15 @@ async def send_event_card(chat_id: int, event: asyncpg.Record, is_social: bool =
     def fmt_date(dt):
         if not dt:
             return "TBA"
-        return dt.strftime("%B %d, %Y at %H:%M")
+        try:
+            # Применяем таймзону (если она не установлена)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(TIMEZONE))
+            else:
+                dt = dt.astimezone(ZoneInfo(TIMEZONE))
+            return dt.strftime("%B %d, %Y at %H:%M") + f" ({TIMEZONE.split('/')[-1]})"
+        except Exception:
+            return str(dt) # Fallback
     
     # Формирование текста
     icon = "💥" if is_social else "🎉"
@@ -1634,41 +1674,51 @@ async def main():
     await ensure_schema()
 
     # Initialize and start API server
-    from api import init_api, create_app
-    from aiohttp import web
+    # Убедитесь, что у вас есть файл api.py
+    try:
+        from api import init_api, create_app
+        from aiohttp import web
+        
+        init_api(
+            pool=_pool,
+            bot=bot,
+            admin_ids=ADMIN_IDS,
+            run_matching=run_matching_once,
+            get_settings_fn=get_settings,
+            set_schedule_days_fn=set_schedule_days,
+            set_schedule_time_fn=set_schedule_time,
+            can_run_now_fn=can_run_now,
+            log_run_start_fn=log_run_start,
+            log_run_finish_fn=log_run_finish,
+            bot_token=BOT_TOKEN
+        )
+        
+        app = await create_app()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', API_PORT)
+        await site.start()
+        
+        print(f"✅ API server started on port {API_PORT}")
+        print(f"✅ Web Admin: {WEBAPP_URL}")
     
-    init_api(
-        pool=_pool,
-        bot=bot,
-        admin_ids=ADMIN_IDS,
-        run_matching=run_matching_once,
-        get_settings_fn=get_settings,
-        set_schedule_days_fn=set_schedule_days,
-        set_schedule_time_fn=set_schedule_time,
-        can_run_now_fn=can_run_now,
-        log_run_start_fn=log_run_start,
-        log_run_finish_fn=log_run_finish,
-        bot_token=BOT_TOKEN
-    )
-    
-    app = await create_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', API_PORT)
-    await site.start()
-    
-    print(f"✅ API server started on port {API_PORT}")
-    print(f"✅ Web Admin: {WEBAPP_URL}")
+    except ImportError:
+        print("!!! ВНИМАНИЕ: Файл api.py не найден. Бот запускается БЕЗ API/WebApp сервера.")
+    except Exception as e:
+        print(f"!!! ОШИБКА: Не удалось запустить API/WebApp сервер: {e}")
+
     print(f"✅ Bot is running...")
 
-    # --- ИЗМЕНЕНИЕ 4: Устанавливаем глобальную кнопку по умолчанию ---
-    # Сбрасываем кнопку меню, установленную в BotFather
+    # Устанавливаем глобальную кнопку по умолчанию
     try:
         await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
         print("Set global default menu button (cleared WebApp).")
     except Exception as e:
         print(f"Could not set global default menu button: {e}")
-    # --- Конец ИЗМЕНЕНИЯ 4 ---
+
+    # --- РЕГИСТРАЦИЯ MIDDLEWARE ---
+    dp.update.outer_middleware(MenuButtonMiddleware())
+    # ---
 
     # Start scheduler and polling
     asyncio.create_task(scheduler_loop())
